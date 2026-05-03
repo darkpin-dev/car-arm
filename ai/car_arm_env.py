@@ -39,7 +39,7 @@ class CarArmEnv(gym.Env):
 
     def _get_angle_from_vector(self, vector):
         x, y, z = vector
-        yaw = np.arctan2(y, x)
+        yaw   = np.arctan2(y, x)
         pitch = np.arctan2(z, np.sqrt(x**2 + y**2) + 1e-6)
         return np.array([yaw, pitch])
 
@@ -48,11 +48,11 @@ class CarArmEnv(gym.Env):
         return self._get_angle_from_vector(ee_forward)
 
     def _get_obs(self):
-        qpos     = self.data.qpos[:5]
-        qvel     = self.data.qvel[:5]
-        ee_pos   = self.data.site_xpos[0]
-        tgt_pos  = self.data.site_xpos[1]
-        rel_pos  = tgt_pos - ee_pos
+        qpos    = self.data.qpos[:5]
+        qvel    = self.data.qvel[:5]
+        ee_pos  = self.data.site_xpos[0]
+        tgt_pos = self.data.site_xpos[1]
+        rel_pos = tgt_pos - ee_pos
 
         ee_angle  = self._get_ee_angle()
         rel_angle = self.goal_angle - ee_angle
@@ -61,7 +61,6 @@ class CarArmEnv(gym.Env):
         return np.concatenate([qpos, qvel, rel_pos, rel_angle]).astype(np.float32)
 
     def _get_info(self, obs=None):
-        """obs를 인자로 받아 이중 계산을 방지합니다."""
         if obs is None:
             obs = self._get_obs()
 
@@ -75,10 +74,12 @@ class CarArmEnv(gym.Env):
         is_success   = (distance < dist_thresh) and (angle_err < angle_thresh)
 
         return {
-            "distance":   distance,
-            "angle_err":  angle_err,
-            "is_success": is_success,
-            "difficulty": self.difficulty,
+            "distance":    distance,
+            "angle_err":   angle_err,
+            "is_success":  is_success,
+            "difficulty":  self.difficulty,
+            "dist_thresh": dist_thresh,
+            "angle_thresh":angle_thresh,
         }
 
     def reset(self, seed=None, options=None):
@@ -92,12 +93,13 @@ class CarArmEnv(gym.Env):
             self.np_random.uniform( 0.15,  0.25) if self.np_random.random() > 0.5
             else self.np_random.uniform(-0.25, -0.15)
         )
-        target_z  = self.np_random.uniform(-0.1, 0.15)
+        target_z   = self.np_random.uniform(-0.1, 0.15)
         target_pos = np.array([target_x, target_y, target_z])
 
-        base_angle      = self._get_angle_from_vector(target_pos)
-        angle_noise     = self.np_random.uniform(-1.0, 1.0, size=2)
-        goal_angle_raw  = base_angle + angle_noise
+        # 사용자 수정 유지: 각도 노이즈 ±1.0 rad 고정
+        base_angle     = self._get_angle_from_vector(target_pos)
+        angle_noise    = self.np_random.uniform(-1.0, 1.0, size=2)
+        goal_angle_raw = base_angle + angle_noise
         self.goal_angle = (goal_angle_raw + np.pi) % (2 * np.pi) - np.pi
 
         target_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "target")
@@ -121,51 +123,77 @@ class CarArmEnv(gym.Env):
 
         obs  = self._get_obs()
         info = self._get_info(obs)
-        dist      = info["distance"]
-        angle_err = info["angle_err"]
+        dist        = info["distance"]
+        angle_err   = info["angle_err"]
+        dist_thresh  = info["dist_thresh"]
+        angle_thresh = info["angle_thresh"]
 
         # ══════════════════════════════════════════════════════════════
-        # 보상 함수 (SAC_2 vs SAC_4 분석 결과 반영)
+        # 보상 함수 설계 원칙
         #
-        #  변경 내역:
-        #  ┌─────────────────────┬─────────┬─────────┬────────────┐
-        #  │ 항목                │ SAC_2   │ SAC_4   │ SAC_5(현재)│
-        #  ├─────────────────────┼─────────┼─────────┼────────────┤
-        #  │ 거리 potential      │  50x    │  50x    │  50x       │
-        #  │ 각도 potential      │  10x    │  30x  ↑ │  30x    ✅ │
-        #  │ 거리 penalty        │   1.0   │   2.0 ↑ │   1.0   ✅ │
-        #  │ 각도 penalty        │   0.5   │   2.0 ↑ │   1.0   ✅ │
-        #  │ 진동 억제 penalty   │  없음   │  0.2    │   0.1   ✅ │
-        #  │ 각도 노이즈 스케일  │ 고정    │ diff비례│ diff비례✅ │
-        #  └─────────────────────┴─────────┴─────────┴────────────┘
+        # 해결하려는 두 가지 구조적 문제:
         #
-        #  근거:
-        #  - 각도 potential 30x 유지 → 각도 학습 신호 강도 보존
-        #  - 거리 penalty 1.0 복원  → SAC_4의 reward 음수화 방지
-        #  - 각도 penalty 1.0       → SAC_2(0.5)보다 강하되 SAC_4(2.0)보다 약하게
-        #                             (중간값: 각도 중요성 반영 + reward 붕괴 방지)
-        #  - 진동 억제 0.1          → SAC_4(0.2)보다 약하게, 신호 간섭 최소화
+        # [문제 1] Potential-based 신호 소멸
+        #   prev - curr 차이는 목표 근처에서 → 0 수렴
+        #   정밀도가 필요한 순간에 gradient가 사라짐
+        #   해결: 지수형 근접 보상 추가 (가까울수록 기하급수적으로 강해짐)
+        #
+        # [문제 2] AND 조건 확률 천장
+        #   P(dist OK) × P(angle OK) ≒ 0.75 × 0.75 = 0.56
+        #   수학적으로 70% 돌파가 구조적으로 어려움
+        #   해결: 복합 달성도(combined ratio)로 AND를 연속 근사
+        #         → 두 조건이 동시에 성공 임계 근처일수록 강한 보상
+        #         → 상수 체류 보너스가 아니므로 reward hacking 없음
         # ══════════════════════════════════════════════════════════════
 
-        # 1. Potential-based 방향 신호
+        # 1. Potential-based 방향 신호 (SAC_5 수준 유지)
         reward  = (self._prev_dist      - dist)      * 50.0
         reward += (self._prev_angle_err - angle_err) * 30.0
         self._prev_dist      = dist
         self._prev_angle_err = angle_err
 
-        # 2. Dense penalty (SAC_2 수준 복원)
-        reward -= dist      * 1.0
-        reward -= angle_err * 1.0   # SAC_2(0.5)보다 강하되 SAC_4(2.0)보다 완만
+        # 2. 지수형 근접 보상 (FIX: 신호 소멸 방지)
+        #    dist/angle_err 가 작아질수록 exp 값이 커짐
+        #    → 정밀 구간에서도 gradient 신호 유지
+        #
+        #    값 범위 예시 (거리):
+        #      dist=0.20m → exp(-4.0) ≈ 0.018 → × 4 = 0.07
+        #      dist=0.05m → exp(-1.0) ≈ 0.368 → × 4 = 1.47
+        #      dist=0.02m → exp(-0.4) ≈ 0.670 → × 4 = 2.68
+        #      dist=0.00m → exp( 0.0) = 1.000 → × 4 = 4.00
+        #
+        #    값 범위 예시 (각도):
+        #      angle=1.0  → exp(-3.0) ≈ 0.050 → × 3 = 0.15
+        #      angle=0.3  → exp(-0.9) ≈ 0.407 → × 3 = 1.22
+        #      angle=0.1  → exp(-0.3) ≈ 0.741 → × 3 = 2.22
+        #      angle=0.0  → exp( 0.0) = 1.000 → × 3 = 3.00
+        reward += np.exp(-dist * 20.0)      * 4.0
+        reward += np.exp(-angle_err * 3.0)  * 3.0
 
-        # 3. 진동 억제 penalty (5cm 이내, 약하게)
+        # 3. 복합 달성도 보상 (FIX: AND 조건 천장 우회)
+        #    dist_ratio, angle_ratio: 0 = 목표 달성, 1 = 임계 경계
+        #    combined: 두 조건이 동시에 임계 근처일수록 1에 가까워짐
+        #    → 위치만 맞추거나 각도만 맞추면 0.5 미만
+        #    → 둘 다 임계 안쪽에서 맞춰야 1에 가까워짐
+        #    → 상수 보너스가 아닌 연속값 → reward hacking 불가
+        dist_ratio  = np.clip(dist      / (dist_thresh  + 1e-6), 0.0, 1.0)
+        angle_ratio = np.clip(angle_err / (angle_thresh + 1e-6), 0.0, 1.0)
+        combined    = (1.0 - dist_ratio) * (1.0 - angle_ratio)
+        reward += combined * 15.0
+
+        # 4. Dense penalty (SAC_5 수준 유지)
+        reward -= dist      * 1.0
+        reward -= angle_err * 1.0
+
+        # 5. 진동 억제 penalty (5cm 이내)
         if dist < 0.05:
             qvel = self.data.qvel[:5]
             reward -= float(np.sum(np.square(qvel))) * 0.1
 
-        # 4. 행동 부드러움 penalty
+        # 6. 행동 부드러움 penalty
         reward -= 0.01 * float(np.sum(np.square(action)))
 
-        # 5. 성공 보너스 (에피소드 내 최강 신호)
+        # 7. 성공 보너스 (에피소드 내 최강 단일 신호)
         terminated = bool(info["is_success"])
         if terminated:
             reward += 200.0
