@@ -1,0 +1,21 @@
+# 1. AMD ROCm 5.7 전용 JAX
+--extra-index-url https://repo.radeon.com/rocm/manylinux/rocm-rel-5.7/
+jax==0.4.26
+jaxlib==0.4.26+rocm570
+
+# 2. NumPy 2.0 충돌 방지
+numpy<2.0.0
+
+# 3. MuJoCo 버전 고정
+mujoco==3.1.5
+mujoco-mjx==3.1.5
+
+# 4. 강화학습 프레임워크
+sbx-rl
+brax
+
+# 5.
+gym==0.26.2
+shimmy>=2.0
+
+tensorboard
